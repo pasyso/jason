@@ -20,9 +20,12 @@ defmodule Jason.Encode do
 
   alias Jason.{Codegen, EncodeError, Encoder, Fragment, OrderedObject}
 
-  @typep escape :: (String.t -> iodata)
-  @typep encode_map :: (map, escape, encode_map -> iodata)
-  @opaque opts :: {escape, encode_map}
+  @type extra_opts :: map()
+  @type escape :: (String.t, String.t, integer -> iodata)
+  @type encode_map :: (map, escape, encode_map, extra_opts -> iodata)
+  @opaque opts :: {escape, encode_map} | {escape, encode_map, extra_opts}
+  # @type opts :: {escape, encode_map, extra_opts}
+  # @opaque opts :: any()
 
   @dialyzer :no_improper_lists
 
@@ -33,52 +36,79 @@ defmodule Jason.Encode do
   def encode(value, opts) do
     escape = escape_function(opts)
     encode_map = encode_map_function(opts)
+    opts1 = Map.drop opts, [:maps, :escape, :compact]
     try do
-      {:ok, value(value, escape, encode_map)}
+      r = value(value, escape, encode_map, opts1)
+      r = if Map.get(opts, :compact), do: compact(r), else: r
+      {:ok, r}
     catch
       :throw, %EncodeError{} = e ->
         {:error, e}
-      :error, {:invalid_byte, _, _} = e ->
-        {:error, EncodeError.new(e)}
       :error, %Protocol.UndefinedError{protocol: Jason.Encoder} = e ->
         {:error, e}
     end
   end
 
+  def compact(nil), do: "null"
+  def compact(["{\"" | _] = map), do: compact_map(map, [])
+  def compact([?[ | _] = list), do: compact_list(list, [])
+  def compact(val), do: val
+
+  defp compact_map([?}], []), do: "{}"
+  defp compact_map([?}], acc), do: [?} | acc] |> Enum.reverse
+  defp compact_map([sep, name, "\":", val | rest], acc) when sep in ["{\"", ",\""] do
+    c_val = compact(val)
+    sep = case acc do
+      [] -> "{\""
+      _ -> sep
+    end
+    acc1 =
+      case val_empty(c_val) do
+        true -> acc
+        _ -> [[sep, name, "\":", c_val] | acc]
+      end
+      compact_map(rest, acc1)
+  end
+
+  defp compact_list([?]], []), do: "[]"
+  defp compact_list([?]], acc), do: [?] | acc] |> Enum.reverse
+  defp compact_list([sep, val | rest], acc) when sep in [?[, ?,] do
+    c_val = compact(val)
+    sep = case acc do
+      [] -> ?[
+      _ -> sep
+    end
+    acc1 =
+      case val_empty(c_val) do
+        true -> acc
+        _ -> [c_val, sep | acc]
+      end
+    compact_list(rest, acc1)
+  end
+
+  defp val_empty([]), do: true
+  defp val_empty("null"), do: true
+  # defp val_empty("[]"), do: true
+  defp val_empty("{}"), do: true
+  defp val_empty(_v), do: false
+
+
   defp encode_map_function(%{maps: maps}) do
     case maps do
-      :naive -> &map_naive/3
-      :strict -> &map_strict/3
+      :naive -> &map_naive/4
+      :strict -> &map_strict/4
     end
   end
 
-  if Code.ensure_loaded?(Jason.Native) do
-    defp escape_function(%{escape: escape}) do
-      case escape do
-        :json -> &Jason.Native.escape_json/1
-        :native_json -> &Jason.Native.escape_json/1
-        :elixir_json -> &escape_json/1
-        :html_safe -> &escape_html/1
-        :unicode_safe -> &escape_unicode/1
-        :javascript_safe -> &escape_javascript/1
-        # Keep for compatibility with Poison
-        :javascript -> &escape_javascript/1
-        :unicode -> &escape_unicode/1
-      end
-    end
-  else
-    defp escape_function(%{escape: escape}) do
-      case escape do
-        :json -> &escape_json/1
-        :native_json -> raise ArgumentError, "jason_native not found, :native_ options not available"
-        :elixir_json -> &escape_json/1
-        :html_safe -> &escape_html/1
-        :unicode_safe -> &escape_unicode/1
-        :javascript_safe -> &escape_javascript/1
-        # Keep for compatibility with Poison
-        :javascript -> &escape_javascript/1
-        :unicode -> &escape_unicode/1
-      end
+  defp escape_function(%{escape: escape}) do
+    case escape do
+      :json -> &escape_json/3
+      :html_safe -> &escape_html/3
+      :unicode_safe -> &escape_unicode/3
+      :javascript_safe -> &escape_javascript/3
+      # Keep for compatibility with Poison
+      :javascript -> &escape_javascript/3
+      :unicode -> &escape_unicode/3
     end
   end
 
@@ -88,45 +118,60 @@ defmodule Jason.Encode do
   Slightly more efficient for built-in types because of the internal dispatching.
   """
   @spec value(term, opts) :: iodata
+  @dialyzer {:nowarn_function, value: 2}
   def value(value, {escape, encode_map}) do
     value(value, escape, encode_map)
   end
 
+  def value(value, {escape, encode_map, extra_opts}) do
+    value(value, escape, encode_map, extra_opts)
+  end
+
   @doc false
   # We use this directly in the helpers and deriving for extra speed
-  def value(value, escape, _encode_map) when is_atom(value) do
+  def value(value, escape, encode_map, opts \\ %{})
+  def value(value, escape, _encode_map, _opts) when is_atom(value) do
     encode_atom(value, escape)
   end
 
-  def value(value, escape, _encode_map) when is_binary(value) do
+  def value(value, escape, _encode_map, _opts) when is_binary(value) do
     encode_string(value, escape)
   end
 
-  def value(value, _escape, _encode_map) when is_integer(value) do
+  def value(value, _escape, _encode_map, _opts) when is_integer(value) do
     integer(value)
   end
 
-  def value(value, _escape, _encode_map) when is_float(value) do
+  def value(value, _escape, _encode_map, _opts) when is_float(value) do
     float(value)
   end
 
-  def value(value, escape, encode_map) when is_list(value) do
-    list(value, escape, encode_map)
+  def value([{}], _escape, _encode_map, _opts), do: "{}"
+  def value([{_, _} | _] = keyword, escape, encode_map, opts) do
+    encode_map.(keyword, escape, encode_map, opts)
   end
 
-  def value(%{__struct__: module} = value, escape, encode_map) do
-    struct(value, escape, encode_map, module)
+  def value(value, escape, encode_map, opts) when is_list(value) do
+    list(value, escape, encode_map, opts)
   end
 
-  def value(value, escape, encode_map) when is_map(value) do
+  def value(%{__struct__: module} = value, escape, encode_map, opts) do
+    struct(value, escape, encode_map, module, opts)
+  end
+
+  def value(value, escape, encode_map, opts) when is_map(value) do
     case Map.to_list(value) do
       [] -> "{}"
-      keyword -> encode_map.(keyword, escape, encode_map)
+      keyword -> encode_map.(keyword, escape, encode_map, opts)
     end
   end
 
-  def value(value, escape, encode_map) do
+  def value(value, escape, encode_map, opts) when opts == %{} do
     Encoder.encode(value, {escape, encode_map})
+  end
+
+  def value(value, escape, encode_map, opts) do
+    Encoder.encode(value, {escape, encode_map, opts})
   end
 
   @compile {:inline, integer: 1, float: 1}
@@ -171,67 +216,79 @@ defmodule Jason.Encode do
     list(list, escape, encode_map)
   end
 
-  defp list([], _escape, _encode_map) do
+  def list(list, {escape, encode_map, opts}) do
+    list(list, escape, encode_map, opts)
+  end
+
+  defp list(list, escape, encode_map, opts \\ %{})
+
+  defp list([], _escape, _encode_map, _opts) do
     "[]"
   end
 
-  defp list([head | tail], escape, encode_map) do
-    [?[, value(head, escape, encode_map)
-     | list_loop(tail, escape, encode_map)]
+  defp list([head | tail], escape, encode_map, opts) do
+    [?[, value(head, escape, encode_map, opts)
+     | list_loop(tail, escape, encode_map, opts)]
   end
 
-  defp list_loop([], _escape, _encode_map) do
+  defp list_loop([], _escape, _encode_map, _opts) do
     ']'
   end
 
-  defp list_loop([head | tail], escape, encode_map) do
-    [?,, value(head, escape, encode_map)
-     | list_loop(tail, escape, encode_map)]
+  defp list_loop([head | tail], escape, encode_map, opts) do
+    [?,, value(head, escape, encode_map, opts)
+     | list_loop(tail, escape, encode_map, opts)]
   end
 
   @spec keyword(keyword, opts) :: iodata
   def keyword(list, _) when list == [], do: "{}"
   def keyword(list, {escape, encode_map}) when is_list(list) do
-    encode_map.(list, escape, encode_map)
+    keyword(list, {escape, encode_map, %{}})
+  end
+  def keyword(list, {escape, encode_map, opts}) when is_list(list) do
+    encode_map.(list, escape, encode_map, opts)
   end
 
   @spec map(map, opts) :: iodata
   def map(value, {escape, encode_map}) do
+    map(value, {escape, encode_map, %{}})
+  end
+  def map(value, {escape, encode_map, opts}) do
     case Map.to_list(value) do
       [] -> "{}"
-      keyword -> encode_map.(keyword, escape, encode_map)
+      keyword -> encode_map.(keyword, escape, encode_map, opts)
     end
   end
 
-  defp map_naive([{key, value} | tail], escape, encode_map) do
+  defp map_naive([{key, value} | tail], escape, encode_map, opts) do
     ["{\"", key(key, escape), "\":",
-    value(value, escape, encode_map)
-    | map_naive_loop(tail, escape, encode_map)]
+    value(value, escape, encode_map, opts)
+    | map_naive_loop(tail, escape, encode_map, opts)]
   end
 
-  defp map_naive_loop([], _escape, _encode_map) do
+  defp map_naive_loop([], _escape, _encode_map, _opts) do
     '}'
   end
 
-  defp map_naive_loop([{key, value} | tail], escape, encode_map) do
+  defp map_naive_loop([{key, value} | tail], escape, encode_map, opts) do
     [",\"", key(key, escape), "\":",
-     value(value, escape, encode_map)
-     | map_naive_loop(tail, escape, encode_map)]
+     value(value, escape, encode_map, opts)
+     | map_naive_loop(tail, escape, encode_map, opts)]
   end
 
-  defp map_strict([{key, value} | tail], escape, encode_map) do
+  defp map_strict([{key, value} | tail], escape, encode_map, opts) do
     key = IO.iodata_to_binary(key(key, escape))
     visited = %{key => []}
     ["{\"", key, "\":",
-     value(value, escape, encode_map)
-     | map_strict_loop(tail, escape, encode_map, visited)]
+     value(value, escape, encode_map, opts)
+     | map_strict_loop(tail, escape, encode_map, visited, opts)]
   end
 
-  defp map_strict_loop([], _encode_map, _escape, _visited) do
+  defp map_strict_loop([], _encode_map, _escape, _visited, _opts) do
     '}'
   end
 
-  defp map_strict_loop([{key, value} | tail], escape, encode_map, visited) do
+  defp map_strict_loop([{key, value} | tail], escape, encode_map, visited, opts) do
     key = IO.iodata_to_binary(key(key, escape))
     case visited do
       %{^key => _} ->
@@ -239,8 +296,8 @@ defmodule Jason.Encode do
       _ ->
         visited = Map.put(visited, key, [])
         [",\"", key, "\":",
-         value(value, escape, encode_map)
-         | map_strict_loop(tail, escape, encode_map, visited)]
+         value(value, escape, encode_map, opts)
+         | map_strict_loop(tail, escape, encode_map, visited, opts)]
     end
   end
 
@@ -249,47 +306,57 @@ defmodule Jason.Encode do
     struct(value, escape, encode_map, module)
   end
 
+  def struct(%module{} = value, {escape, encode_map, opts}) do
+    struct(value, escape, encode_map, module, opts)
+  end
+
+  defp struct(value, escape, encode_map, module, opts \\ %{})
+
   # TODO: benchmark the effect of inlining the to_iso8601 functions
   for module <- [Date, Time, NaiveDateTime, DateTime] do
-    defp struct(value, _escape, _encode_map, unquote(module)) do
+    defp struct(value, _escape, _encode_map, unquote(module), _opts) do
       [?", unquote(module).to_iso8601(value), ?"]
     end
   end
 
-  defp struct(value, _escape, _encode_map, Decimal) do
+  defp struct(value, _escape, _encode_map, Decimal, _opts) do
     # silence the xref warning
     decimal = Decimal
     [?", decimal.to_string(value, :normal), ?"]
   end
 
-  defp struct(value, escape, encode_map, Fragment) do
+  defp struct(value, escape, encode_map, Fragment, _opts) do
     %{encode: encode} = value
     encode.({escape, encode_map})
   end
 
-  defp struct(value, escape, encode_map, OrderedObject) do
+  defp struct(value, escape, encode_map, OrderedObject, opts) do
     case value do
       %{values: []} -> "{}"
-      %{values: values} -> encode_map.(values, escape, encode_map)
+      %{values: values} -> encode_map.(values, escape, encode_map, opts)
     end
   end
 
-  defp struct(value, escape, encode_map, _module) do
+  defp struct(value, escape, encode_map, _module, opts) when opts == %{} do
     Encoder.encode(value, {escape, encode_map})
+  end
+
+  defp struct(value, escape, encode_map, _module, opts) do
+    Encoder.encode(value, {escape, encode_map, opts})
   end
 
   @doc false
   # This is used in the helpers and deriving implementation
   def key(string, escape) when is_binary(string) do
-    escape.(string)
+    escape.(string, string, 0)
   end
   def key(atom, escape) when is_atom(atom) do
     string = Atom.to_string(atom)
-    escape.(string)
+    escape.(string, string, 0)
   end
   def key(other, escape) do
     string = String.Chars.to_string(other)
-    escape.(string)
+    escape.(string, string, 0)
   end
 
   @spec string(String.t, opts) :: iodata
@@ -298,7 +365,7 @@ defmodule Jason.Encode do
   end
 
   defp encode_string(string, escape) do
-    [?", escape.(string), ?"]
+    [?", escape.(string, string, 0), ?"]
   end
 
   slash_escapes = Enum.zip('\b\t\n\f\r\"\\', 'btnfr"\\')
@@ -321,8 +388,8 @@ defmodule Jason.Encode do
 
   json_jt = Codegen.jump_table(ranges, :chunk, 0x7F + 1)
 
-  defp escape_json(data) do
-    escape_json(data, [], data, 0)
+  defp escape_json(data, original, skip) do
+    escape_json(data, [], original, skip)
   end
 
   Enum.map(json_jt, fn
@@ -391,8 +458,8 @@ defmodule Jason.Encode do
 
   ## javascript safe JSON escape
 
-  defp escape_javascript(data) do
-    escape_javascript(data, [], data, 0)
+  defp escape_javascript(data, original, skip) do
+    escape_javascript(data, [], original, skip)
   end
 
   Enum.map(json_jt, fn
@@ -476,8 +543,8 @@ defmodule Jason.Encode do
 
   html_jt = Codegen.jump_table(html_ranges, :chunk, 0x7F + 1)
 
-  defp escape_html(data) do
-    escape_html(data, [], data, 0)
+  defp escape_html(data, original, skip) do
+    escape_html(data, [], original, skip)
   end
 
   Enum.map(html_jt, fn
@@ -559,8 +626,8 @@ defmodule Jason.Encode do
 
   ## unicode escape
 
-  defp escape_unicode(data) do
-    escape_unicode(data, [], data, 0)
+  defp escape_unicode(data, original, skip) do
+    escape_unicode(data, [], original, skip)
   end
 
   Enum.map(json_jt, fn
