@@ -23,9 +23,7 @@ defmodule Jason.Encode do
   @type extra_opts :: map()
   @type escape :: (String.t, String.t, integer -> iodata)
   @type encode_map :: (map, escape, encode_map, extra_opts -> iodata)
-  @opaque opts :: {escape, encode_map} | {escape, encode_map, extra_opts}
-  # @type opts :: {escape, encode_map, extra_opts}
-  # @opaque opts :: any()
+  @type opts :: {escape, encode_map} | {escape, encode_map, extra_opts}
 
   @dialyzer :no_improper_lists
 
@@ -118,7 +116,7 @@ defmodule Jason.Encode do
   Slightly more efficient for built-in types because of the internal dispatching.
   """
   @spec value(term, opts) :: iodata
-  @dialyzer {:nowarn_function, value: 2}
+  # @dialyzer {:nowarn_function, value: 2}
   def value(value, {escape, encode_map}) do
     value(value, escape, encode_map)
   end
