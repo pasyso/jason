@@ -23,7 +23,9 @@ defmodule Jason.Encode do
   @type extra_opts :: map()
   @type escape :: (String.t, String.t, integer -> iodata)
   @type encode_map :: (map, escape, encode_map, extra_opts -> iodata)
-  @type opts :: {escape, encode_map} | {escape, encode_map, extra_opts}
+  @opaque opts :: {escape, encode_map} | {escape, encode_map, extra_opts}
+  # @type opts :: {escape, encode_map, extra_opts}
+  # @opaque opts :: any()
 
   @dialyzer :no_improper_lists
 
@@ -111,7 +113,7 @@ defmodule Jason.Encode do
   end
 
   @doc """
-  Equivalent to calling the `Jason.Encoder.encode/2` protocol function1.
+  Equivalent to calling the `Jason.Encoder.encode/2` protocol function.
 
   Slightly more efficient for built-in types because of the internal dispatching.
   """
